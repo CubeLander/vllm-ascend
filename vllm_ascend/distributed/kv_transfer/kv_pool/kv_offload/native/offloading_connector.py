@@ -131,6 +131,35 @@ def _canonicalize_split_cache(
                 f"component_bytes={part_block_bytes}, "
                 f"page_size_bytes={unpadded_page_size_bytes}"
             )
+        # Hybrid attention can expose K/V views of interleaved physical
+        # blocks. Coalesce the complete packed block, not each strided part.
+        # Keep rejecting gaps/overlaps: those need a different copy contract.
+        factor = unpadded_page_size_bytes // bytes_per_physical_block
+        if factor > 1 and len(parts) > 1:
+            ordered = sorted(zip(parts, part_block_bytes), key=lambda item: item[0].data_ptr())
+            first = ordered[0][0]
+            start = first.data_ptr()
+            cursor = start
+            packed = True
+            for part, part_bytes in ordered:
+                packed = packed and (
+                    part.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+                    and part.data_ptr() == cursor
+                    and part.stride(0) * part.element_size() == bytes_per_physical_block
+                )
+                cursor += part_bytes
+            if packed:
+                for part, part_bytes in ordered:
+                    _make_int8_block_view(part, num_blocks * factor, 1, part_bytes)
+                raw = torch.empty(0, dtype=torch.int8, device=first.device).set_(first.untyped_storage())
+                physical = torch.as_strided(
+                    raw,
+                    (num_blocks * factor, bytes_per_physical_block),
+                    (bytes_per_physical_block, 1),
+                    first.storage_offset() * first.element_size(),
+                )
+                return ((_make_int8_block_view(physical, num_blocks, factor, bytes_per_physical_block),
+                         unpadded_page_size_bytes),)
         selected = tuple(zip(parts, part_block_bytes))
 
     bytes_per_physical_block = sum(size for _, size in selected)
